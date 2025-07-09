@@ -10,6 +10,7 @@ from flask import Flask, render_template, request, send_file, jsonify, flash
 import os
 import tempfile
 import json
+import uuid
 from datetime import datetime
 from main import MailingListGenerator
 from yelp_api_client import YelpAPIClient
@@ -17,6 +18,9 @@ from excel_generator import ExcelGenerator
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-this')
+
+# In-memory file storage for temporary files
+file_storage = {}
 
 # Load Yelp categories for the dropdown
 def load_categories():
@@ -100,33 +104,66 @@ def generate_mailing_list():
         # Create summary sheet
         generator.excel_generator.create_summary_sheet(businesses, temp_path)
         
+        # Generate unique file ID and store file info
+        file_id = str(uuid.uuid4())
+        file_storage[file_id] = {
+            'path': temp_path,
+            'filename': filename,
+            'created_at': datetime.now()
+        }
+        
+        # Clean up old files (older than 1 hour)
+        cleanup_old_files()
+        
         # Return success response with file info
         return jsonify({
             'success': True,
             'message': f'Found {len(businesses)} businesses',
             'filename': filename,
-            'file_path': temp_path,
+            'file_id': file_id,
             'business_count': len(businesses)
         })
         
     except Exception as e:
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
 
-@app.route('/download/<path:file_path>')
-def download_file(file_path):
+def cleanup_old_files():
+    """Clean up files older than 1 hour."""
+    current_time = datetime.now()
+    files_to_remove = []
+    
+    for file_id, file_info in file_storage.items():
+        time_diff = current_time - file_info['created_at']
+        if time_diff.total_seconds() > 3600:  # 1 hour
+            files_to_remove.append(file_id)
+    
+    for file_id in files_to_remove:
+        try:
+            if os.path.exists(file_storage[file_id]['path']):
+                os.unlink(file_storage[file_id]['path'])
+            del file_storage[file_id]
+        except:
+            pass
+
+@app.route('/download/<file_id>')
+def download_file(file_id):
     """Download the generated Excel file."""
     try:
-        # Security check - ensure file is in temp directory
-        if not file_path.startswith('/tmp/') and not file_path.startswith(tempfile.gettempdir()):
-            return jsonify({'error': 'Invalid file path'}), 400
+        # Check if file exists in storage
+        if file_id not in file_storage:
+            return jsonify({'error': 'File not found or expired'}), 404
         
+        file_info = file_storage[file_id]
+        file_path = file_info['path']
+        filename = file_info['filename']
+        
+        # Check if file still exists on disk
         if not os.path.exists(file_path):
-            return jsonify({'error': 'File not found'}), 404
+            # Remove from storage if file doesn't exist
+            del file_storage[file_id]
+            return jsonify({'error': 'File not found on disk'}), 404
         
-        # Get filename from path
-        filename = os.path.basename(file_path)
-        
-        # Send file and then delete it
+        # Send file
         response = send_file(
             file_path,
             as_attachment=True,
@@ -140,6 +177,8 @@ def download_file(file_path):
             try:
                 if os.path.exists(file_path):
                     os.unlink(file_path)
+                if file_id in file_storage:
+                    del file_storage[file_id]
             except:
                 pass
         
